@@ -21,6 +21,7 @@ from tqdm import tqdm
 
 FILE = Path(__file__).absolute()
 sys.path.append(FILE.parents[0].as_posix())  # add yolov5/ to path
+torch.cuda.set_device(5)
 
 import val
 from models.yolo import Model
@@ -30,7 +31,7 @@ from utils.general import labels_to_class_weights, increment_path, labels_to_ima
     strip_optimizer, get_latest_run, check_dataset, check_file, check_img_size, \
     print_mutation, set_logging, one_cycle, colorstr, methods
 from utils.downloads import attempt_download
-from utils.loss import ComputeLoss
+from utils.loss_finetune import ComputeLoss
 from utils.plots import plot_labels, plot_evolve
 from utils.torch_utils import EarlyStopping, ModelEMA, de_parallel, intersect_dicts, select_device, \
     torch_distributed_zero_first
@@ -38,11 +39,33 @@ from utils.metrics import fitness
 from utils.loggers import Loggers
 from utils.callbacks import Callbacks
 from pdb import set_trace as st
+from mask_generation_online import mask_imgs, whether_mask
 
 LOGGER = logging.getLogger(__name__)
 LOCAL_RANK = int(os.getenv('LOCAL_RANK', -1))  # https://pytorch.org/docs/stable/elastic/run.html
 RANK = int(os.getenv('RANK', -1))
 WORLD_SIZE = int(os.getenv('WORLD_SIZE', 1))
+
+
+def del_tensor_ele(arr,index):
+    arr1 = arr[0:index]
+    arr2 = arr[index+1:]
+    return torch.cat((arr1,arr2), dim=0)
+
+
+def delete_masked_targets(imgs, targets, paths):
+    masked_imgs = []
+    masks = {}  # 这玩意到底要写成啥样才能足够优雅呢
+    for i in range(opt.batch_size):
+        masked_imgs[i], mask_area = mask_imgs(imgs[i], paths[i])
+        masks[i] = [paths[i], np.array(mask_area)]
+        st()
+    for j, target in enumerate(targets):
+        if (target[0] in masks.keys()) and (target[1] is not 0):  # target[0] or target[0]-1?
+            flag = whether_mask(target[2:6], masks[target[0]][1], imgs[target[0]])
+            if flag:
+                targets = del_tensor_ele(targets, j)
+    return masked_imgs, targets
 
 
 def train(hyp,  # path/to/hyp.yaml or hyp dictionary
@@ -87,9 +110,6 @@ def train(hyp,  # path/to/hyp.yaml or hyp dictionary
         for k in methods(loggers):
             callbacks.register_action(k, callback=getattr(loggers, k))
 
-    '''
-        加载相关日志功能:如logger,wandb
-    '''
     # Config
     plots = not evolve  # create plots
     cuda = device.type != 'cpu'
@@ -107,9 +127,6 @@ def train(hyp,  # path/to/hyp.yaml or hyp dictionary
     kp_bbox = data_dict.get('kp_bbox')
     num_coords = data_dict.get('num_coords', 0)
 
-    '''
-        加载模型
-    '''
     # Model
     pretrained = weights.endswith('.pt')
     if pretrained:
@@ -125,9 +142,6 @@ def train(hyp,  # path/to/hyp.yaml or hyp dictionary
     else:
         model = Model(cfg, ch=3, nc=nc, anchors=hyp.get('anchors'), num_coords=num_coords).to(device)  # create
 
-    '''
-        冰冻一些层，使得这些层在反向传播的时候不再更新权重,需要冻结的层,可以写在freeze列表中
-    '''
     # Freeze
     freeze = [f'model.{x}.' for x in range(freeze)]  # layers to freeze
     for k, v in model.named_parameters():
@@ -136,22 +150,15 @@ def train(hyp,  # path/to/hyp.yaml or hyp dictionary
             print(f'freezing {k}')
             v.requires_grad = False
 
-    '''
-        nbs为名义批次,比如实际批次为16,那么64/16=4,每4次迭代，才进行一次反向传播更新权重，可以节约显存.
-    '''
     # Optimizer
     nbs = 64  # nominal batch size
     accumulate = max(round(nbs / batch_size), 1)  # accumulate loss before optimizing
     hyp['weight_decay'] *= batch_size * accumulate / nbs  # scale weight_decay
     LOGGER.info(f"Scaled weight_decay = {hyp['weight_decay']}")
 
-    '''
-        设置优化器，权重weight使用了正则化,偏置bias则不使用正则化
-        g0 g1 g2分别是啥
-    '''
     g0, g1, g2 = [], [], []  # optimizer parameter groups
     for v in model.modules():
-        if hasattr(v, 'bias') and isinstance(v.bias, nn.Parameter):  # bias,hasattr()函数用于判断对象是否包含对应的属性
+        if hasattr(v, 'bias') and isinstance(v.bias, nn.Parameter):  # bias
             g2.append(v.bias)
         if isinstance(v, nn.BatchNorm2d):  # weight (no decay)
             g0.append(v.weight)
@@ -172,9 +179,6 @@ def train(hyp,  # path/to/hyp.yaml or hyp dictionary
                 f"{len(g0)} weight, {len(g1)} weight (no decay), {len(g2)} bias")
     del g0, g1, g2
 
-    '''
-        设置学习率策略:两者可供选择，线性学习率和余弦退火学习率
-    '''
     # Scheduler
     if opt.linear_lr:
         lf = lambda x: (1 - x / (epochs - 1)) * (1.0 - hyp['lrf']) + hyp['lrf']  # linear
@@ -182,15 +186,9 @@ def train(hyp,  # path/to/hyp.yaml or hyp dictionary
         lf = one_cycle(1, hyp['lrf'], epochs)  # cosine 1->hyp['lrf']
     scheduler = lr_scheduler.LambdaLR(optimizer, lr_lambda=lf)  # plot_lr_scheduler(optimizer, scheduler, epochs)
 
-    '''
-        设置(针对权重的)ema（指数移动平均）:目的是为了收敛的曲线更加平滑
-    '''
     # EMA
     ema = ModelEMA(model) if RANK in [-1, 0] else None
 
-    '''
-        继续接着训练,需要加载优化器,ema模型,训练结果txt,周期
-    '''
     # Resume
     start_epoch, best_fitness = 0, 0.0
     if pretrained:
@@ -214,22 +212,11 @@ def train(hyp,  # path/to/hyp.yaml or hyp dictionary
 
         del ckpt, csd
 
-    '''
-        模型默认的下采样倍率model.stride: [8,16,32]
-        gs代表模型下采样的最大步长: 后续为了保证输入模型的图片宽高是最大步长的整数倍
-        nl代表模型输出的尺度,默认为3个尺度, 分别下采样8倍，16倍，32倍.   nl=3
-        imgsz, imgsz_test代表训练和测试的图片大小，比如opt.img_size=[640,480]，那么训练图片的最大边为640,测试图片最大边为480
-        如果opt.img_size=[640],那么自动补成[640,640]
-        当然比如这边imgsz是640,那么训练的图片是640*640吗，不一定，具体看你怎么设置，默认是padding成正方形进行训练的.
-    '''
     # Image sizes
     gs = max(int(model.stride.max()), 32)  # grid size (max stride)
     nl = model.model[-1].nl  # number of detection layers (used for scaling hyp['obj'])
     imgsz = check_img_size(opt.imgsz, gs, floor=gs * 2)  # verify imgsz is gs-multiple
 
-    '''
-        多卡训练
-    '''
     # DP mode
     if cuda and RANK == -1 and torch.cuda.device_count() > 1:
         logging.warning('DP not recommended, instead use torch.distributed.run for best DDP Multi-GPU results.\n'
@@ -241,22 +228,15 @@ def train(hyp,  # path/to/hyp.yaml or hyp dictionary
         model = torch.nn.SyncBatchNorm.convert_sync_batchnorm(model).to(device)
         LOGGER.info('Using SyncBatchNorm()')
 
-    '''
-        加载数据集
-    '''
     # Trainloader
     train_loader, dataset = create_dataloader(train_path, labels_dir, imgsz, batch_size // WORLD_SIZE, gs, single_cls,
                                               hyp=hyp, augment=True, cache=opt.cache, rect=opt.rect, rank=RANK,
                                               workers=workers, image_weights=opt.image_weights, quad=opt.quad,
                                               prefix=colorstr('train: '), kp_flip=kp_flip, kp_bbox=kp_bbox)
-    st()
     mlc = int(np.concatenate(dataset.labels, 0)[:, 0].max())  # max label class
     nb = len(train_loader)  # number of batches
     assert mlc < nc, f'Label class {mlc} exceeds nc={nc} in {data}. Possible class labels are 0-{nc - 1}'
 
-    '''
-        检验加载的数据集是否正确:  利用数据集中的最大类别<nc
-    '''
     # Process 0
     if RANK in [-1, 0]:
         val_loader = create_dataloader(val_path, labels_dir, imgsz, batch_size // WORLD_SIZE, gs, single_cls,
@@ -283,9 +263,6 @@ def train(hyp,  # path/to/hyp.yaml or hyp dictionary
     if cuda and RANK != -1:
         model = DDP(model, device_ids=[LOCAL_RANK], output_device=LOCAL_RANK)
 
-    '''
-        模型参数的一些调整
-    '''
     # Model parameters
     hyp['box'] *= 3. / nl  # scale to layers
     hyp['cls'] *= nc / 80. * 3. / nl  # scale to classes and layers
@@ -330,13 +307,13 @@ def train(hyp,  # path/to/hyp.yaml or hyp dictionary
         if RANK != -1:
             train_loader.sampler.set_epoch(epoch)
         pbar = enumerate(train_loader)
-        st()
         LOGGER.info(('\n' + '%10s' * 8) % ('Epoch', 'gpu_mem', 'box', 'obj', 'cls', 'kps', 'labels', 'img_size'))
         if RANK in [-1, 0]:
             pbar = tqdm(pbar, total=nb)  # progress bar
         optimizer.zero_grad()
         for i, (imgs, targets, paths, _) in pbar:  # batch -------------------------------------------------------------
             st()
+            imgs, targets = delete_masked_targets(imgs, targets, paths)
             ni = i + nb * epoch  # number integrated batches (since train start)
             imgs = imgs.to(device, non_blocking=True).float() / 255.0  # uint8 to float32, 0-255 to 0.0-1.0
 
@@ -351,9 +328,6 @@ def train(hyp,  # path/to/hyp.yaml or hyp dictionary
                     if 'momentum' in x:
                         x['momentum'] = np.interp(ni, xi, [hyp['warmup_momentum'], hyp['momentum']])
 
-            '''
-                对图片尺寸进行变换，多尺度训练，在opt参数里面可以选择开启或关闭    
-            '''
             # Multi-scale
             if opt.multi_scale:
                 sz = random.randrange(imgsz * 0.5, imgsz * 1.5 + gs) // gs * gs  # size
@@ -541,7 +515,6 @@ def main(opt):
         from datetime import timedelta
         # print(torch.cuda.device_count())
         # print(LOCAL_RANK)
-        # st()
         assert torch.cuda.device_count() > LOCAL_RANK, 'insufficient CUDA devices for DDP command'
         assert opt.batch_size % WORLD_SIZE == 0, '--batch-size must be multiple of CUDA device count'
         assert not opt.image_weights, '--image-weights argument is not compatible with DDP training'
